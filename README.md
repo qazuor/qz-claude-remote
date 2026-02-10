@@ -1,1 +1,1 @@
-# claude-code-zellij-web-conector
+# qz-zellij-web
