@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# qazuor-claude .. Persistent Claude Code sessions via tmux + ngrok
+# ---------------------------------------------------------------------------
+
+readonly VERSION="1.0.0"
+readonly NAMESPACE="qazuor-claude"
+readonly META_DIR="$HOME/.qazuor-claude"
+readonly NGROK_API="http://127.0.0.1:4040/api/tunnels"
+readonly NGROK_PORT=7681
+readonly NOTIFY_CMD="notify"
+readonly NGROK_POLL_ATTEMPTS=15
+readonly NGROK_POLL_INTERVAL=2
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_red()    { printf '\033[0;31m%s\033[0m\n' "$*"; }
+_green()  { printf '\033[0;32m%s\033[0m\n' "$*"; }
+_yellow() { printf '\033[0;33m%s\033[0m\n' "$*"; }
+_cyan()   { printf '\033[0;36m%s\033[0m\n' "$*"; }
+_bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
+
+_die() { _red "error: $*" >&2; exit 1; }
+_warn() { _yellow "warning: $*" >&2; }
+
+_session_name() { echo "${NAMESPACE}::${1}"; }
+
+_ensure_meta_dir() {
+    [[ -d "$META_DIR" ]] || mkdir -p "$META_DIR"
+}
+
+_meta_file() { echo "${META_DIR}/${1}.json"; }
+
+_session_exists() {
+    tmux has-session -t "$(_session_name "$1")" 2>/dev/null
+}
+
+_require_session() {
+    local name="$1"
+    _session_exists "$name" || _die "session '$name' does not exist"
+}
+
+_require_jq() {
+    command -v jq >/dev/null 2>&1 || _die "jq is required but not installed"
+}
+
+_default_name() {
+    basename "$(pwd)"
+}
+
+_read_meta() {
+    local file
+    file="$(_meta_file "$1")"
+    [[ -f "$file" ]] || _die "metadata not found for '$1'"
+    cat "$file"
+}
+
+_write_meta() {
+    local name="$1" path="$2" url="$3"
+    _ensure_meta_dir
+    local file
+    file="$(_meta_file "$name")"
+    cat > "$file" <<EOF
+{
+  "name": "${name}",
+  "path": "${path}",
+  "ngrokUrl": "${url}",
+  "startedAt": "$(date -Iseconds)"
+}
+EOF
+}
+
+_delete_meta() {
+    local file
+    file="$(_meta_file "$1")"
+    [[ -f "$file" ]] && rm -f "$file"
+}
+
+# Poll ngrok local API until a public URL is available
+_poll_ngrok_url() {
+    local url=""
+    for (( i=1; i<=NGROK_POLL_ATTEMPTS; i++ )); do
+        url=$(curl -s "$NGROK_API" 2>/dev/null \
+            | jq -r '.tunnels[0].public_url // empty' 2>/dev/null) || true
+        if [[ -n "$url" ]]; then
+            echo "$url"
+            return 0
+        fi
+        sleep "$NGROK_POLL_INTERVAL"
+    done
+    return 1
+}
+
+_send_notification() {
+    local name="$1" url="$2"
+    if ! command -v "$NOTIFY_CMD" >/dev/null 2>&1; then
+        _warn "notify (qz-notifier) not found. Skipping notification."
+        return
+    fi
+    local body
+    body=$(printf "Session: %s\nURL: %s\n\nAttach:\n  qazuor-claude attach %s\n\nStop:\n  qazuor-claude stop %s" \
+        "$name" "$url" "$name" "$name")
+    "$NOTIFY_CMD" \
+        -t "qazuor-claude :: ${name}" \
+        -p high \
+        -g "computer,link" \
+        -c "$url" \
+        "$body" || _warn "notification failed"
+}
+
+_confirm() {
+    local prompt="${1:-Continue?}"
+    printf '%s [y/N] ' "$prompt"
+    read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_init() {
+    local name="${1:-$(_default_name)}"
+
+    _require_jq
+
+    if _session_exists "$name"; then
+        _yellow "Session '$name' already exists."
+        printf "  (a) attach to existing session\n"
+        printf "  (n) create new session with numeric suffix\n"
+        printf "  (q) cancel\n"
+        printf "Choice [a/n/q]: "
+        read -r choice
+        case "$choice" in
+            a|A) cmd_attach "$name"; return ;;
+            n|N)
+                local base="$name" seq=2
+                while _session_exists "${base}-${seq}"; do
+                    (( seq++ ))
+                done
+                name="${base}-${seq}"
+                _cyan "Using name: $name"
+                ;;
+            *) echo "Cancelled."; return ;;
+        esac
+    fi
+
+    local sess
+    sess="$(_session_name "$name")"
+    local work_dir
+    work_dir="$(pwd)"
+
+    # Create tmux session with claude window
+    tmux new-session -d -s "$sess" -n claude -c "$work_dir"
+    tmux send-keys -t "${sess}:claude" "claude" C-m
+
+    # Create ngrok window
+    tmux new-window -t "$sess" -n ngrok
+    tmux send-keys -t "${sess}:ngrok" "ngrok http ${NGROK_PORT}" C-m
+
+    _green "Waiting for ngrok tunnel..."
+    local ngrok_url=""
+    if ngrok_url=$(_poll_ngrok_url); then
+        _green "Tunnel ready: $ngrok_url"
+    else
+        _warn "Could not obtain ngrok URL. Use 'qazuor-claude recover $name' later."
+        ngrok_url="(unavailable)"
+    fi
+
+    _write_meta "$name" "$work_dir" "$ngrok_url"
+    _send_notification "$name" "$ngrok_url"
+
+    _green "Session '$name' created."
+    printf "  attach:  qazuor-claude attach %s\n" "$name"
+    printf "  stop:    qazuor-claude stop %s\n" "$name"
+    if [[ "$ngrok_url" != "(unavailable)" ]]; then
+        printf "  url:     %s\n" "$ngrok_url"
+    fi
+}
+
+cmd_attach() {
+    local name="${1:-$(_default_name)}"
+    _require_session "$name"
+    local sess
+    sess="$(_session_name "$name")"
+
+    if [[ -n "${TMUX:-}" ]]; then
+        tmux switch-client -t "$sess"
+    else
+        tmux attach-session -t "$sess"
+    fi
+}
+
+cmd_stop() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || _die "usage: qazuor-claude stop <name>"
+    _require_session "$name"
+
+    _confirm "Stop session '$name'? This kills all processes." || { echo "Cancelled."; return; }
+
+    local sess
+    sess="$(_session_name "$name")"
+    tmux kill-session -t "$sess"
+    _delete_meta "$name"
+    _green "Session '$name' stopped and metadata removed."
+}
+
+cmd_list() {
+    local sessions
+    sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^${NAMESPACE}::" || true)
+
+    if [[ -z "$sessions" ]]; then
+        echo "No active sessions."
+        return
+    fi
+
+    _bold "Active sessions:"
+    while IFS= read -r sess; do
+        local short="${sess#${NAMESPACE}::}"
+        local meta_file
+        meta_file="$(_meta_file "$short")"
+        local url="(no metadata)"
+        local path=""
+        if [[ -f "$meta_file" ]]; then
+            url=$(jq -r '.ngrokUrl // "(none)"' "$meta_file" 2>/dev/null) || url="(parse error)"
+            path=$(jq -r '.path // ""' "$meta_file" 2>/dev/null) || path=""
+        fi
+        printf "  %-30s %s\n" "$short" "$url"
+        [[ -n "$path" ]] && printf "  %-30s %s\n" "" "$path"
+    done <<< "$sessions"
+}
+
+cmd_rename() {
+    local old="${1:-}" new="${2:-}"
+    [[ -n "$old" && -n "$new" ]] || _die "usage: qazuor-claude rename <old> <new>"
+    _require_session "$old"
+
+    if _session_exists "$new"; then
+        _die "session '$new' already exists"
+    fi
+
+    local old_sess new_sess
+    old_sess="$(_session_name "$old")"
+    new_sess="$(_session_name "$new")"
+
+    tmux rename-session -t "$old_sess" "$new_sess"
+
+    local old_meta new_meta
+    old_meta="$(_meta_file "$old")"
+    new_meta="$(_meta_file "$new")"
+
+    if [[ -f "$old_meta" ]]; then
+        _require_jq
+        jq --arg n "$new" '.name = $n' "$old_meta" > "$new_meta"
+        rm -f "$old_meta"
+    fi
+
+    _green "Renamed '$old' -> '$new'"
+}
+
+cmd_info() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || _die "usage: qazuor-claude info <name>"
+    _require_session "$name"
+    _require_jq
+
+    local sess
+    sess="$(_session_name "$name")"
+
+    _bold "Session: $name"
+    echo ""
+
+    _cyan "tmux windows:"
+    tmux list-windows -t "$sess" -F '  #{window_index}: #{window_name} #{window_active}' 2>/dev/null
+
+    echo ""
+    local meta_file
+    meta_file="$(_meta_file "$name")"
+    if [[ -f "$meta_file" ]]; then
+        _cyan "metadata:"
+        jq '.' "$meta_file"
+    else
+        _warn "No metadata file found."
+    fi
+}
+
+cmd_open() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || _die "usage: qazuor-claude open <name>"
+    _require_jq
+
+    local meta_file
+    meta_file="$(_meta_file "$name")"
+    [[ -f "$meta_file" ]] || _die "no metadata for '$name'"
+
+    local url
+    url=$(jq -r '.ngrokUrl // empty' "$meta_file")
+    [[ -n "$url" ]] || _die "no ngrok URL in metadata"
+
+    echo "$url"
+}
+
+cmd_recover() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || _die "usage: qazuor-claude recover <name>"
+    _require_session "$name"
+    _require_jq
+
+    local sess
+    sess="$(_session_name "$name")"
+
+    # Kill existing ngrok window if present
+    tmux kill-window -t "${sess}:ngrok" 2>/dev/null || true
+    sleep 1
+
+    # Recreate ngrok window
+    tmux new-window -t "$sess" -n ngrok
+    tmux send-keys -t "${sess}:ngrok" "ngrok http ${NGROK_PORT}" C-m
+
+    _green "Waiting for ngrok tunnel..."
+    local ngrok_url=""
+    if ngrok_url=$(_poll_ngrok_url); then
+        _green "Tunnel recovered: $ngrok_url"
+    else
+        _die "Could not obtain ngrok URL after ${NGROK_POLL_ATTEMPTS} attempts"
+    fi
+
+    # Update metadata
+    local meta_file
+    meta_file="$(_meta_file "$name")"
+    if [[ -f "$meta_file" ]]; then
+        local tmp
+        tmp=$(mktemp)
+        jq --arg u "$ngrok_url" '.ngrokUrl = $u' "$meta_file" > "$tmp" && mv "$tmp" "$meta_file"
+    else
+        _write_meta "$name" "$(pwd)" "$ngrok_url"
+    fi
+
+    _send_notification "$name" "$ngrok_url"
+    _green "Session '$name' recovered. URL: $ngrok_url"
+}
+
+cmd_doctor() {
+    local deps=("tmux" "jq" "curl" "ngrok" "claude" "notify")
+    local all_ok=true
+
+    _bold "Checking dependencies..."
+    echo ""
+    for dep in "${deps[@]}"; do
+        if command -v "$dep" >/dev/null 2>&1; then
+            local ver=""
+            case "$dep" in
+                tmux)  ver=$(tmux -V 2>/dev/null || echo "?") ;;
+                jq)    ver=$(jq --version 2>/dev/null || echo "?") ;;
+                curl)  ver=$(curl --version 2>/dev/null | head -1 || echo "?") ;;
+                ngrok) ver=$(ngrok version 2>/dev/null || echo "?") ;;
+                claude) ver=$(claude --version 2>/dev/null || echo "?") ;;
+                notify) ver=$(notify --version 2>/dev/null || echo "?") ;;
+            esac
+            _green "  [ok]  $dep  ($ver)"
+        else
+            _red "  [!!]  $dep  NOT FOUND"
+            all_ok=false
+        fi
+    done
+
+    echo ""
+    if [[ "$all_ok" == true ]]; then
+        _green "All dependencies satisfied."
+    else
+        _red "Some dependencies are missing. Install them before using qazuor-claude."
+    fi
+
+    echo ""
+    _bold "Metadata directory:"
+    if [[ -d "$META_DIR" ]]; then
+        local count
+        count=$(find "$META_DIR" -name '*.json' -type f 2>/dev/null | wc -l)
+        _green "  $META_DIR  ($count session files)"
+    else
+        _yellow "  $META_DIR  (does not exist yet, will be created on first init)"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+$(_bold "qazuor-claude") v${VERSION} .. Persistent Claude Code sessions via tmux + ngrok
+
+$(_bold "USAGE")
+  qazuor-claude <command> [args]
+
+$(_bold "COMMANDS")
+  init [name]          Create a new session (default: current directory name)
+  attach [name]        Attach to an existing session
+  stop <name>          Stop and remove a session
+  list                 List active sessions
+  rename <old> <new>   Rename a session
+  info <name>          Show session details
+  open <name>          Print the ngrok public URL
+  recover <name>       Restart ngrok and update URL
+  doctor               Check system dependencies
+  help                 Show this help
+  version              Show version
+
+$(_bold "EXAMPLES")
+  qazuor-claude init myproject
+  qazuor-claude attach myproject
+  qazuor-claude list
+  qazuor-claude stop myproject
+
+$(_bold "FILES")
+  ~/.qazuor-claude/<name>.json    Session metadata
+
+$(_bold "NOTIFICATIONS")
+  Sent via qz-notifier (notify). Requires qz-notifier installed.
+  See: https://github.com/qazuor/qz-notifier
+EOF
+}
+
+cmd_version() {
+    echo "qazuor-claude v${VERSION}"
+}
+
+# ---------------------------------------------------------------------------
+# Main dispatcher
+# ---------------------------------------------------------------------------
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        init)     cmd_init "$@" ;;
+        attach)   cmd_attach "$@" ;;
+        stop)     cmd_stop "$@" ;;
+        list|ls)  cmd_list "$@" ;;
+        rename)   cmd_rename "$@" ;;
+        info)     cmd_info "$@" ;;
+        open)     cmd_open "$@" ;;
+        recover)  cmd_recover "$@" ;;
+        doctor)   cmd_doctor "$@" ;;
+        help|-h|--help) cmd_help ;;
+        version|-v|--version) cmd_version ;;
+        *)        _die "unknown command: $cmd (try 'qazuor-claude help')" ;;
+    esac
+}
+
+main "$@"
