@@ -1,0 +1,4 @@
+logs/
+.claude/.log/
+.claude/reports/*.md
+!.claude/reports/.gitkeep
