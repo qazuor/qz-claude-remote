@@ -1,1 +1,1 @@
-# qz-zellij-web
+# qz-claude-remote
